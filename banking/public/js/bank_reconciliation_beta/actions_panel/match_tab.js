@@ -109,7 +109,8 @@ erpnext.accounts.bank_reconciliation.MatchTab = class MatchTab {
 				{
 					content: row.reference_date || row.posting_date, // Reference Date
 					format: (value) => {
-						return row.date_match ? value.bold() : value;
+						const formatted_date = frappe.format(value, {fieldtype: "Date"});
+						return row.date_match ? formatted_date.bold() : formatted_date;
 					}
 				},
 				{
@@ -462,9 +463,6 @@ erpnext.accounts.bank_reconciliation.MatchTab = class MatchTab {
 			{
 				name: __("Date"),
 				editable: false,
-				format: (value) => {
-					return frappe.format(value, {fieldtype: "Date"});
-				},
 			},
 			{
 				name: __("Outstanding"),
