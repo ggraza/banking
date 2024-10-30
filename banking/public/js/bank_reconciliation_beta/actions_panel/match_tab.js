@@ -476,10 +476,12 @@ erpnext.accounts.bank_reconciliation.MatchTab = class MatchTab {
 			{
 				name: __("Party"),
 				editable: false,
+				align: "left",
 			},
 			{
 				name: __("Voucher"),
 				editable: false,
+				align: "left",
 			},
 		];
 	}
