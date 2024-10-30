@@ -558,7 +558,8 @@ def get_matching_queries(
 
 	common_filters.exact_party_match = "exact_party_match" in (document_types or [])
 
-	if "payment_entry" in document_types and frappe.has_permission("Payment Entry"):
+	if "payment_entry" in document_types:
+		frappe.has_permission("Payment Entry", throw=True)
 		query = get_pe_matching_query(
 			exact_match,
 			common_filters,
@@ -571,7 +572,8 @@ def get_matching_queries(
 		)
 		queries.append(query)
 
-	if "journal_entry" in document_types and frappe.has_permission("Journal Entry"):
+	if "journal_entry" in document_types:
+		frappe.has_permission("Journal Entry", throw=True)
 		query = get_je_matching_query(
 			exact_match,
 			common_filters,
@@ -596,8 +598,7 @@ def get_matching_queries(
 	if include_unpaid:
 		kwargs.company = company
 		for doctype, fn in invoice_queries_map.items():
-			if not frappe.has_permission(frappe.unscrub(doctype)):
-				continue
+			frappe.has_permission(frappe.unscrub(doctype), throw=True)
 
 			if doctype in ["sales_invoice", "purchase_invoice"]:
 				kwargs.include_only_returns = doctype != invoice_dt
@@ -607,16 +608,19 @@ def get_matching_queries(
 
 			queries.append(fn(**kwargs))
 	elif fn := invoice_queries_map.get(invoice_dt):
-		if frappe.has_permission(frappe.unscrub(invoice_dt)):
-			queries.append(fn(**kwargs))
+		frappe.has_permission(frappe.unscrub(invoice_dt), throw=True)
+		queries.append(fn(**kwargs))
 
-	if "loan_disbursement" in document_types and is_withdrawal and frappe.has_permission("Loan Disbursement"):
+	if "loan_disbursement" in document_types and is_withdrawal:
+		frappe.has_permission("Loan Disbursement", throw=True)
 		queries.append(get_ld_matching_query(exact_match, common_filters))
 
-	if "loan_repayment" in document_types and is_deposit and frappe.has_permission("Loan Repayment"):
+	if "loan_repayment" in document_types and is_deposit:
+		frappe.has_permission("Loan Repayment", throw=True)
 		queries.append(get_lr_matching_query(exact_match, common_filters))
 
-	if "bank_transaction" in document_types and frappe.has_permission("Bank Transaction"):
+	if "bank_transaction" in document_types:
+		frappe.has_permission("Bank Transaction", throw=True)
 		query = get_bt_matching_query(exact_match, common_filters, transaction.name)
 		queries.append(query)
 
