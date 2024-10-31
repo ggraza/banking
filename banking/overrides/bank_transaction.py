@@ -44,8 +44,8 @@ class CustomBankTransaction(BankTransaction):
 		latest_period_close_date = frappe.db.get_value(
 			"Period Closing Voucher",
 			{"company": self.company, "docstatus": 1},
-			"posting_date",
-			order_by="posting_date desc",
+			"period_end_date",
+			order_by="period_end_date desc",
 		)
 		if latest_period_close_date and getdate(self.date) <= getdate(
 			latest_period_close_date
