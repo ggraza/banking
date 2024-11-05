@@ -33,16 +33,20 @@ def get_bank_transactions(
 	to_date: str | datetime.date = None,
 	order_by: str | datetime.date = "date asc",
 ):
-	# returns bank transactions for a bank account
-	filters = []
-	filters.append(["bank_account", "=", bank_account])
-	filters.append(["docstatus", "=", 1])
-	filters.append(["unallocated_amount", ">", 0.0])
+	"""Return bank transactions for a bank account"""
+	filters = [
+		["bank_account", "=", bank_account],
+		["docstatus", "=", 1],
+		["unallocated_amount", ">", 0.001],
+	]
+
 	if to_date:
 		filters.append(["date", "<=", to_date])
+
 	if from_date:
 		filters.append(["date", ">=", from_date])
-	transactions = frappe.get_all(
+
+	return frappe.get_list(
 		"Bank Transaction",
 		fields=[
 			"date",
@@ -64,7 +68,6 @@ def get_bank_transactions(
 		filters=filters,
 		order_by=order_by,
 	)
-	return transactions
 
 
 @frappe.whitelist()
@@ -85,6 +88,8 @@ def create_journal_entry_bts(
 		allow_edit = sbool(allow_edit)
 
 	bank_transaction = frappe.get_doc("Bank Transaction", bank_transaction_name)
+	bank_transaction.check_permission("read")
+
 	if bank_transaction.deposit and bank_transaction.withdrawal:
 		frappe.throw(
 			_(
@@ -396,8 +401,10 @@ def get_linked_payments(
 	from_reference_date: str | datetime.date = None,
 	to_reference_date: str | datetime.date = None,
 ) -> list:
-	# get all matching payments for a bank transaction
+	"""Get all matching payments for a bank transaction"""
 	transaction = frappe.get_doc("Bank Transaction", bank_transaction_name)
+	transaction.check_permission("read")
+
 	gl_account, company = frappe.db.get_value(
 		"Bank Account", transaction.bank_account, ["account", "company"]
 	)
@@ -555,6 +562,7 @@ def get_matching_queries(
 	common_filters.exact_party_match = "exact_party_match" in (document_types or [])
 
 	if "payment_entry" in document_types:
+		frappe.has_permission("Payment Entry", throw=True)
 		query = get_pe_matching_query(
 			exact_match,
 			common_filters,
@@ -568,6 +576,7 @@ def get_matching_queries(
 		queries.append(query)
 
 	if "journal_entry" in document_types:
+		frappe.has_permission("Journal Entry", throw=True)
 		query = get_je_matching_query(
 			exact_match,
 			common_filters,
@@ -592,6 +601,8 @@ def get_matching_queries(
 	if include_unpaid:
 		kwargs.company = company
 		for doctype, fn in invoice_queries_map.items():
+			frappe.has_permission(frappe.unscrub(doctype), throw=True)
+
 			if doctype in ["sales_invoice", "purchase_invoice"]:
 				kwargs.include_only_returns = doctype != invoice_dt
 			elif kwargs.include_only_returns is not None:
@@ -599,17 +610,20 @@ def get_matching_queries(
 				del kwargs.include_only_returns
 
 			queries.append(fn(**kwargs))
-	else:
-		if fn := invoice_queries_map.get(invoice_dt):
-			queries.append(fn(**kwargs))
+	elif fn := invoice_queries_map.get(invoice_dt):
+		frappe.has_permission(frappe.unscrub(invoice_dt), throw=True)
+		queries.append(fn(**kwargs))
 
 	if "loan_disbursement" in document_types and is_withdrawal:
+		frappe.has_permission("Loan Disbursement", throw=True)
 		queries.append(get_ld_matching_query(exact_match, common_filters))
 
 	if "loan_repayment" in document_types and is_deposit:
+		frappe.has_permission("Loan Repayment", throw=True)
 		queries.append(get_lr_matching_query(exact_match, common_filters))
 
 	if "bank_transaction" in document_types:
+		frappe.has_permission("Bank Transaction", throw=True)
 		query = get_bt_matching_query(exact_match, common_filters, transaction.name)
 		queries.append(query)
 
