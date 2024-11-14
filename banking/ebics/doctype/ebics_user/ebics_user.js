@@ -51,7 +51,8 @@ frappe.ui.form.on("EBICS User", {
 								callback: () => frm.reload_doc(),
 							});
 						},
-						__("Initialize EBICS User")
+						__("Initialize EBICS User"),
+						__("Initialize")
 					);
 				},
 				frm.doc.initialized ? __("Actions") : null
@@ -62,19 +63,24 @@ frappe.ui.form.on("EBICS User", {
 			frm.add_custom_button(
 				__("Verify Bank Keys"),
 				async () => {
-					bank_keys = await get_bank_keys(frm.doc.name);
+					let passphrase = null;
+					if (!frm.doc.passphrase) {
+						passphrase = await ask_for_passphrase();
+					}
+
+					const bank_keys = await get_bank_keys(frm.doc.name, passphrase);
 					if (!bank_keys) {
 						return;
 					}
 
-					message = __(
+					const message = __(
 						"Please confirm that the following keys are identical to the ones mentioned on your bank's letter:"
 					);
 					frappe.confirm(
 						`<p>${message}</p>
 						<pre>${bank_keys}</pre>`,
 						async () => {
-							await confirm_bank_keys(frm.doc.name);
+							await confirm_bank_keys(frm.doc.name, passphrase);
 							frm.reload_doc();
 						}
 					);
@@ -91,11 +97,32 @@ frappe.ui.form.on("EBICS User", {
 	},
 });
 
-async function get_bank_keys(ebics_user) {
+
+function ask_for_passphrase() {
+	return new Promise((resolve) => {
+		frappe.prompt(
+			[
+				{
+					fieldname: "passphrase",
+					label: __("Passphrase"),
+					fieldtype: "Password",
+					reqd: true,
+				},
+			],
+			(values) => {
+				resolve(values.passphrase);
+			},
+			__("Enter Passphrase"),
+			__("Continue")
+		);
+	});
+}
+
+async function get_bank_keys(ebics_user, passphrase) {
 	try {
 		return await frappe.xcall(
 			"banking.ebics.doctype.ebics_user.ebics_user.download_bank_keys",
-			{ ebics_user: ebics_user }
+			{ ebics_user: ebics_user, passphrase: passphrase }
 		);
 	} catch (e) {
 		frappe.show_alert({
@@ -105,11 +132,11 @@ async function get_bank_keys(ebics_user) {
 	}
 }
 
-async function confirm_bank_keys(ebics_user) {
+async function confirm_bank_keys(ebics_user, passphrase) {
 	try {
 		await frappe.xcall(
 			"banking.ebics.doctype.ebics_user.ebics_user.confirm_bank_keys",
-			{ ebics_user: ebics_user }
+			{ ebics_user: ebics_user, passphrase: passphrase }
 		);
 		frappe.show_alert({
 			message: __("Bank keys confirmed"),
@@ -172,6 +199,7 @@ function download_bank_statements(ebics_user, needs_passphrase) {
 				});
 			}
 		},
-		__("Download Bank Statements")
+		__("Download Bank Statements"),
+		__("Download")
 	);
 }
