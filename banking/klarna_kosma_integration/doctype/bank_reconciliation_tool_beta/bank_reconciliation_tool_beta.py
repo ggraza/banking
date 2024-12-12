@@ -8,8 +8,8 @@ import frappe
 from frappe import _
 from frappe.model.document import Document
 from frappe.query_builder.custom import ConstantColumn
-from frappe.query_builder.functions import Coalesce, CustomFunction
 from frappe.utils import cint, flt, sbool
+from frappe.query_builder.functions import Cast, Coalesce
 
 from erpnext import get_company_currency, get_default_cost_center
 from erpnext.accounts.doctype.bank_transaction.bank_transaction import (
@@ -17,11 +17,16 @@ from erpnext.accounts.doctype.bank_transaction.bank_transaction import (
 	get_total_allocated_amount,
 )
 from erpnext.accounts.utils import get_account_currency
+from banking.klarna_kosma_integration.doctype.bank_reconciliation_tool_beta.utils import (
+	amount_rank_condition,
+	get_description_match_condition,
+	get_reference_field_map,
+	ref_equality_condition,
+)
+
 from pypika import Order
 
 MAX_QUERY_RESULTS = 150
-Instr = CustomFunction("INSTR", ["a", "b"])
-RegExpReplace = CustomFunction("REGEXP_REPLACE", ["a", "b", "c"])
 
 
 class BankReconciliationToolBeta(Document):
@@ -599,6 +604,7 @@ def get_matching_queries(
 	include_unpaid = "unpaid_invoices" in document_types
 	invoice_dt = "sales_invoice" if is_deposit else "purchase_invoice"
 	invoice_queries_map = get_invoice_function_map(document_types, is_deposit)
+	reference_field_map = get_reference_field_map()
 
 	kwargs = frappe._dict(
 		exact_match=exact_match,
@@ -609,7 +615,7 @@ def get_matching_queries(
 		kwargs.company = company
 		for doctype, fn in invoice_queries_map.items():
 			frappe.has_permission(frappe.unscrub(doctype), throw=True)
-
+			kwargs.reference_field = reference_field_map.get(doctype, "name")
 			if doctype in ["sales_invoice", "purchase_invoice"]:
 				kwargs.include_only_returns = doctype != invoice_dt
 			elif kwargs.include_only_returns is not None:
@@ -619,6 +625,7 @@ def get_matching_queries(
 			queries.append(fn(**kwargs))
 	elif fn := invoice_queries_map.get(invoice_dt):
 		frappe.has_permission(frappe.unscrub(invoice_dt), throw=True)
+		kwargs.reference_field = reference_field_map.get(invoice_dt, "name")
 		queries.append(fn(**kwargs))
 
 	if "loan_disbursement" in document_types and is_withdrawal:
@@ -645,28 +652,27 @@ def get_bt_matching_query(
 	# same bank account must have same company and currency
 	bt = frappe.qb.DocType("Bank Transaction")
 	field = "deposit" if common_filters.payment_type == "Pay" else "withdrawal"
+	amount_field = getattr(bt, field)
 
-	ref_rank = (
-		frappe.qb.terms.Case()
-		.when(bt.reference_number == common_filters.reference_no, 1)
-		.else_(0)
-	)
+	ref_rank = ref_equality_condition(bt.reference_number, common_filters.reference_no)
 	unallocated_rank = (
 		frappe.qb.terms.Case()
 		.when(bt.unallocated_amount == common_filters.amount, 1)
 		.else_(0)
 	)
 
-	amount_equality = getattr(bt, field) == common_filters.amount
-	amount_rank = frappe.qb.terms.Case().when(amount_equality, 1).else_(0)
+	amount_rank = amount_rank_condition(amount_field, common_filters.amount)
+	amount_filter = (
+		amount_field == common_filters.amount if exact_match else amount_field > 0.0
+	)
 
-	party_condition = (
+	party_filter = (
 		(bt.party_type == common_filters.party_type)
 		& (bt.party == common_filters.party)
 		& bt.party.isnotnull()
 	)
-	party_rank = frappe.qb.terms.Case().when(party_condition, 1).else_(0)
-	amount_condition = amount_equality if exact_match else getattr(bt, field) > 0.0
+	party_rank = frappe.qb.terms.Case().when(party_filter, 1).else_(0)
+
 	rank_expression = ref_rank + amount_rank + party_rank + unallocated_rank + 1
 
 	query = (
@@ -690,21 +696,20 @@ def get_bt_matching_query(
 		.where(bt.status != "Reconciled")
 		.where(bt.name != transaction_name)
 		.where(bt.bank_account == common_filters.bank_account)
-		.where(amount_condition)
+		.where(amount_filter)
 		.where(bt.docstatus == 1)
 		.orderby(rank_expression, order=Order.desc)
 		.limit(MAX_QUERY_RESULTS)
 	)
 
 	if common_filters.exact_party_match:
-		query = query.where(party_condition)
+		query = query.where(party_filter)
 
 	return query
 
 
 def get_ld_matching_query(exact_match: bool, common_filters: frappe._dict):
 	loan_disbursement = frappe.qb.DocType("Loan Disbursement")
-	matching_reference = loan_disbursement.reference_number == common_filters
 	matching_party = (
 		loan_disbursement.applicant_type == common_filters.party_type
 		and loan_disbursement.applicant == common_filters.matching_party
@@ -716,7 +721,9 @@ def get_ld_matching_query(exact_match: bool, common_filters: frappe._dict):
 	)
 	date_rank = frappe.qb.terms.Case().when(date_condition, 1).else_(0)
 
-	reference_rank = frappe.qb.terms.Case().when(matching_reference, 1).else_(0)
+	reference_rank = ref_equality_condition(
+		loan_disbursement.reference_number, common_filters.reference_no
+	)
 	party_rank = frappe.qb.terms.Case().when(matching_party, 1).else_(0)
 
 	rank_expression = reference_rank + party_rank + date_rank + 1
@@ -755,7 +762,6 @@ def get_ld_matching_query(exact_match: bool, common_filters: frappe._dict):
 
 def get_lr_matching_query(exact_match: bool, common_filters: frappe._dict):
 	loan_repayment = frappe.qb.DocType("Loan Repayment")
-	matching_reference = loan_repayment.reference_number == common_filters.reference_no
 	matching_party = (
 		loan_repayment.applicant_type == common_filters.party_type
 		and loan_repayment.applicant == common_filters.party
@@ -767,7 +773,9 @@ def get_lr_matching_query(exact_match: bool, common_filters: frappe._dict):
 	)
 	date_rank = frappe.qb.terms.Case().when(date_condition, 1).else_(0)
 
-	reference_rank = frappe.qb.terms.Case().when(matching_reference, 1).else_(0)
+	reference_rank = ref_equality_condition(
+		loan_repayment.reference_number, common_filters.reference_no
+	)
 	party_rank = frappe.qb.terms.Case().when(matching_party, 1).else_(0)
 
 	rank_expression = reference_rank + party_rank + date_rank + 1
@@ -817,24 +825,24 @@ def get_pe_matching_query(
 	from_reference_date: str | datetime.date = None,
 	to_reference_date: str | datetime.date = None,
 ):
-	to_from = "to" if common_filters.payment_type == "Receive" else "from"
-	currency_field = f"paid_{to_from}_account_currency"
-	payment_type = common_filters.payment_type
 	pe = frappe.qb.DocType("Payment Entry")
+	to_from = "to" if common_filters.payment_type == "Receive" else "from"
+	payment_type = common_filters.payment_type
+	currency_field = getattr(pe, f"paid_{to_from}_account_currency")
 
-	ref_condition = pe.reference_no == common_filters.reference_no
-	ref_rank = frappe.qb.terms.Case().when(ref_condition, 1).else_(0)
+	ref_rank = ref_equality_condition(pe.reference_no, common_filters.reference_no)
 
-	amount_equality = pe.paid_amount == common_filters.amount
-	amount_rank = frappe.qb.terms.Case().when(amount_equality, 1).else_(0)
-	amount_condition = amount_equality if exact_match else pe.paid_amount > 0.0
-
-	party_condition = (
-		(pe.party_type == common_filters.party_type)
-		& (pe.party == common_filters.party)
-		& pe.party.isnotnull()
+	amount_rank = amount_rank_condition(pe.paid_amount, common_filters.amount)
+	amount_filter = (
+		pe.paid_amount == common_filters.amount if exact_match else pe.paid_amount > 0.0
 	)
-	party_rank = frappe.qb.terms.Case().when(party_condition, 1).else_(0)
+
+	party_filter = (
+		(pe.party == common_filters.party)
+		& (pe.party_type == common_filters.party_type)
+		& (pe.party.isnotnull())
+	)
+	party_rank = frappe.qb.terms.Case().when(party_filter, 1).else_(0)
 
 	filter_by_date = pe.posting_date.between(from_date, to_date)
 	if cint(filter_by_reference_date):
@@ -858,7 +866,7 @@ def get_pe_matching_query(
 			pe.party_name,
 			pe.party_type,
 			pe.posting_date,
-			getattr(pe, currency_field).as_("currency"),
+			currency_field.as_("currency"),
 			ref_rank.as_("reference_number_match"),
 			amount_rank.as_("amount_match"),
 			party_rank.as_("party_match"),
@@ -868,16 +876,16 @@ def get_pe_matching_query(
 		.where(pe.payment_type.isin([payment_type, "Internal Transfer"]))
 		.where(pe.clearance_date.isnull())
 		.where(getattr(pe, account_from_to) == common_filters.bank_account)
-		.where(amount_condition)
+		.where(amount_filter)
 		.where(filter_by_date)
 		.orderby(rank_expression, order=Order.desc)
 		.limit(MAX_QUERY_RESULTS)
 	)
 
 	if frappe.flags.auto_reconcile_vouchers:
-		query = query.where(ref_condition)
+		query = query.where(pe.reference_no == common_filters.reference_no)
 	if common_filters.exact_party_match:
-		query = query.where(party_condition)
+		query = query.where(party_filter)
 
 	return query
 
@@ -895,16 +903,17 @@ def get_je_matching_query(
 	# We have mapping at the bank level
 	# So one bank could have both types of bank accounts like asset and liability
 	# So cr_or_dr should be judged only on basis of withdrawal and deposit and not account type
-	cr_or_dr = "credit" if common_filters.payment_type == "Pay" else "debit"
 	je = frappe.qb.DocType("Journal Entry")
 	jea = frappe.qb.DocType("Journal Entry Account")
 
-	ref_condition = je.cheque_no == common_filters.reference_no
-	ref_rank = frappe.qb.terms.Case().when(ref_condition, 1).else_(0)
+	cr_or_dr = "credit" if common_filters.payment_type == "Pay" else "debit"
+	amount_field = getattr(jea, f"{cr_or_dr}_in_account_currency")
 
-	amount_field = f"{cr_or_dr}_in_account_currency"
-	amount_equality = getattr(jea, amount_field) == common_filters.amount
-	amount_rank = frappe.qb.terms.Case().when(amount_equality, 1).else_(0)
+	ref_rank = ref_equality_condition(je.cheque_no, common_filters.reference_no)
+	amount_rank = amount_rank_condition(amount_field, common_filters.amount)
+	amount_filter = (
+		amount_field == common_filters.amount if exact_match else amount_field > 0.0
+	)
 
 	filter_by_date = je.posting_date.between(from_date, to_date)
 	if cint(filter_by_reference_date):
@@ -923,7 +932,7 @@ def get_je_matching_query(
 			rank_expression.as_("rank"),
 			ConstantColumn("Journal Entry").as_("doctype"),
 			je.name,
-			getattr(jea, amount_field).as_("paid_amount"),
+			amount_field.as_("paid_amount"),
 			je.cheque_no.as_("reference_no"),
 			je.cheque_date.as_("reference_date"),
 			je.pay_to_recd_from.as_("party"),
@@ -938,7 +947,7 @@ def get_je_matching_query(
 		.where(je.voucher_type != "Opening Entry")
 		.where(je.clearance_date.isnull())
 		.where(jea.account == common_filters.bank_account)
-		.where(amount_equality if exact_match else getattr(jea, amount_field) > 0.0)
+		.where(amount_filter)
 		.where(je.docstatus == 1)
 		.where(filter_by_date)
 		.orderby(rank_expression, order=Order.desc)
@@ -946,35 +955,56 @@ def get_je_matching_query(
 	)
 
 	if frappe.flags.auto_reconcile_vouchers:
-		query = query.where(ref_condition)
+		query = query.where(je.cheque_no == common_filters.reference_no)
 
 	return query
 
 
 def get_si_matching_query(
-	exact_match: bool, currency: str, common_filters: frappe._dict
+	exact_match: bool,
+	currency: str,
+	common_filters: frappe._dict,
+	reference_field: str = "name",
 ):
 	"""
 	Get matching sales invoices when they are also used as payment entries (POS).
 	"""
-	si = frappe.qb.DocType("Sales Invoice")
-	sip = frappe.qb.DocType("Sales Invoice Payment")
+	si = frappe.qb.DocType("Sales Invoice").as_("si")
+	sip = frappe.qb.DocType("Sales Invoice Payment").as_("sip")
+	description = common_filters.description
 
-	amount_equality = sip.amount == common_filters.amount
-	amount_rank = frappe.qb.terms.Case().when(amount_equality, 1).else_(0)
-	amount_condition = amount_equality if exact_match else sip.amount != 0.0
+	amount_rank = amount_rank_condition(sip.amount, common_filters.amount)
+	amount_filter = (
+		sip.amount == common_filters.amount if exact_match else sip.amount != 0.0
+	)
 
-	party_condition = si.customer == common_filters.party
-	party_rank = frappe.qb.terms.Case().when(party_condition, 1).else_(0)
+	party_filter = si.customer == common_filters.party
+	party_rank = frappe.qb.terms.Case().when(party_filter, 1).else_(0)
 
 	date_condition = si.posting_date == common_filters.date
 	date_rank = frappe.qb.terms.Case().when(date_condition, 1).else_(0)
 
-	description_match = get_description_match_condition(
-		common_filters.description, si.name
+	# Check reference field equality with common_filters.reference_no
+	reference_field_is_set = reference_field and reference_field != "name"
+	reference_number = common_filters.reference_no
+	ref_rank = (
+		ref_equality_condition(si[reference_field], reference_number)
+		if (reference_number and reference_field_is_set)
+		else Cast(0, "int")
 	)
 
-	rank_expression = party_rank + amount_rank + date_rank + description_match + 1
+	# if ref field is configured (!= name), perform desc-name and desc-ref match
+	# otherwise (== name), then perform desc-name match once
+	name_match = get_description_match_condition(description, si, "name")
+	ref_match = (
+		get_description_match_condition(description, si, reference_field)
+		if reference_field_is_set
+		else Cast(0, "int")
+	)
+
+	rank_expression = (
+		ref_rank + party_rank + amount_rank + date_rank + name_match + ref_match + 1
+	)
 
 	query = (
 		frappe.qb.from_(sip)
@@ -985,7 +1015,7 @@ def get_si_matching_query(
 			ConstantColumn("Sales Invoice").as_("doctype"),
 			si.name,
 			sip.amount.as_("paid_amount"),
-			si.name.as_("reference_no"),
+			si[reference_field or "name"].as_("reference_no"),
 			si.posting_date.as_("reference_date"),
 			si.customer.as_("party"),
 			ConstantColumn("Customer").as_("party_type"),
@@ -994,19 +1024,21 @@ def get_si_matching_query(
 			party_rank.as_("party_match"),
 			amount_rank.as_("amount_match"),
 			date_rank.as_("date_match"),
-			description_match.as_("name_in_desc_match"),
+			name_match.as_("name_in_desc_match"),
+			ref_match.as_("ref_in_desc_match"),
+			ref_rank.as_("reference_number_match"),
 		)
 		.where(si.docstatus == 1)
 		.where(sip.clearance_date.isnull())
 		.where(sip.account == common_filters.bank_account)
-		.where(amount_condition)
+		.where(amount_filter)
 		.where(si.currency == currency)
 		.orderby(rank_expression, order=Order.desc)
 		.limit(MAX_QUERY_RESULTS)
 	)
 
 	if common_filters.exact_party_match:
-		query = query.where(party_condition)
+		query = query.where(party_filter)
 
 	return query
 
@@ -1017,20 +1049,37 @@ def get_unpaid_si_matching_query(
 	common_filters: frappe._dict,
 	company: str,
 	include_only_returns: bool = False,
+	reference_field: str = "name",
 ):
 	sales_invoice = frappe.qb.DocType("Sales Invoice")
+	description = common_filters.description
 
-	party_condition = sales_invoice.customer == common_filters.party
-	party_match = frappe.qb.terms.Case().when(party_condition, 1).else_(0)
+	party_filter = sales_invoice.customer == common_filters.party
+	party_rank = frappe.qb.terms.Case().when(party_filter, 1).else_(0)
 
-	outstanding_amount_condition = (
-		sales_invoice.outstanding_amount == common_filters.amount
+	amount_rank = amount_rank_condition(
+		sales_invoice.outstanding_amount, common_filters.amount
 	)
-	amount_match = frappe.qb.terms.Case().when(outstanding_amount_condition, 1).else_(0)
-	description_match = get_description_match_condition(
-		common_filters.description, sales_invoice.name
+
+	# Check reference field equality with common_filters.reference_no
+	reference_field_is_set = reference_field and reference_field != "name"
+	reference_number = common_filters.reference_no
+	ref_rank = (
+		ref_equality_condition(sales_invoice[reference_field], reference_number)
+		if (reference_number and reference_field_is_set)
+		else Cast(0, "int")
 	)
-	rank_expression = party_match + amount_match + description_match + 1
+
+	# if ref field is configured (!= name), perform desc-name and desc-ref match
+	# otherwise (== name), then perform desc-name match once
+	name_match = get_description_match_condition(description, sales_invoice, "name")
+	ref_match = (
+		get_description_match_condition(description, sales_invoice, reference_field)
+		if reference_field_is_set
+		else Cast(0, "int")
+	)
+
+	rank_expression = ref_rank + party_rank + amount_rank + name_match + ref_match + 1
 
 	query = (
 		frappe.qb.from_(sales_invoice)
@@ -1039,16 +1088,18 @@ def get_unpaid_si_matching_query(
 			ConstantColumn("Sales Invoice").as_("doctype"),
 			sales_invoice.name.as_("name"),
 			sales_invoice.outstanding_amount.as_("paid_amount"),
-			sales_invoice.name.as_("reference_no"),
+			sales_invoice[reference_field or "name"].as_("reference_no"),
 			sales_invoice.posting_date.as_("reference_date"),
 			sales_invoice.customer.as_("party"),
 			ConstantColumn("Customer").as_("party_type"),
 			sales_invoice.customer_name.as_("party_name"),
 			sales_invoice.posting_date,
 			sales_invoice.currency,
-			party_match.as_("party_match"),
-			amount_match.as_("amount_match"),
-			description_match.as_("name_in_desc_match"),
+			party_rank.as_("party_match"),
+			amount_rank.as_("amount_match"),
+			name_match.as_("name_in_desc_match"),
+			(ref_match).as_("ref_in_desc_match"),
+			(ref_rank).as_("reference_number_match"),
 		)
 		.where(sales_invoice.docstatus == 1)
 		.where(sales_invoice.company == company)  # because we do not have bank account check
@@ -1061,29 +1112,36 @@ def get_unpaid_si_matching_query(
 	if include_only_returns:
 		query = query.where(sales_invoice.is_return == 1)
 	if exact_match:
-		query = query.where(outstanding_amount_condition)
+		query = query.where(sales_invoice.outstanding_amount == common_filters.amount)
 	if common_filters.exact_party_match:
-		query = query.where(party_condition)
+		query = query.where(party_filter)
 
 	return query
 
 
 def get_pi_matching_query(
-	exact_match: bool, currency: str, common_filters: frappe._dict
+	exact_match: bool,
+	currency: str,
+	common_filters: frappe._dict,
+	reference_field: str = "name",
 ):
 	"""
 	Get matching purchase invoice query when they are also used as payment entries (is_paid)
 	"""
 	purchase_invoice = frappe.qb.DocType("Purchase Invoice")
+	description = common_filters.description
 
-	amount_equality = purchase_invoice.paid_amount == common_filters.amount
-	amount_rank = frappe.qb.terms.Case().when(amount_equality, 1).else_(0)
-	amount_condition = (
-		amount_equality if exact_match else purchase_invoice.paid_amount != 0.0
+	amount_rank = amount_rank_condition(
+		purchase_invoice.paid_amount, common_filters.amount
+	)
+	amount_filter = (
+		(purchase_invoice.paid_amount == common_filters.amount)
+		if exact_match
+		else purchase_invoice.paid_amount != 0.0
 	)
 
-	party_condition = purchase_invoice.supplier == common_filters.party
-	party_rank = frappe.qb.terms.Case().when(party_condition, 1).else_(0)
+	party_filter = purchase_invoice.supplier == common_filters.party
+	party_rank = frappe.qb.terms.Case().when(party_filter, 1).else_(0)
 
 	# date of BT and paid PI could be the same (date of payment or the date of the bill)
 	date_condition = (
@@ -1092,11 +1150,27 @@ def get_pi_matching_query(
 	)
 	date_rank = frappe.qb.terms.Case().when(date_condition, 1).else_(0)
 
-	description_match = get_description_match_condition(
-		common_filters.description, purchase_invoice.name
+	# Check reference field equality with common_filters.reference_no
+	reference_field_is_set = reference_field and reference_field != "name"
+	reference_number = common_filters.reference_no
+	ref_rank = (
+		ref_equality_condition(purchase_invoice[reference_field], reference_number)
+		if (reference_number and reference_field_is_set)
+		else Cast(0, "int")
 	)
 
-	rank_expression = party_rank + amount_rank + date_rank + description_match + 1
+	# if ref field is configured (!= name), perform desc-name and desc-ref match
+	# otherwise (== name), then perform desc-name match once
+	name_match = get_description_match_condition(description, purchase_invoice, "name")
+	ref_match = (
+		get_description_match_condition(description, purchase_invoice, reference_field)
+		if reference_field_is_set
+		else Cast(0, "int")
+	)
+
+	rank_expression = (
+		ref_rank + party_rank + amount_rank + date_rank + name_match + ref_match + 1
+	)
 
 	query = (
 		frappe.qb.from_(purchase_invoice)
@@ -1105,7 +1179,7 @@ def get_pi_matching_query(
 			ConstantColumn("Purchase Invoice").as_("doctype"),
 			purchase_invoice.name,
 			purchase_invoice.paid_amount,
-			purchase_invoice.bill_no.as_("reference_no"),
+			purchase_invoice[reference_field or "bill_no"].as_("reference_no"),
 			purchase_invoice.bill_date.as_("reference_date"),
 			purchase_invoice.supplier.as_("party"),
 			ConstantColumn("Supplier").as_("party_type"),
@@ -1115,20 +1189,22 @@ def get_pi_matching_query(
 			party_rank.as_("party_match"),
 			amount_rank.as_("amount_match"),
 			date_rank.as_("date_match"),
-			description_match.as_("name_in_desc_match"),
+			name_match.as_("name_in_desc_match"),
+			(ref_match).as_("ref_in_desc_match"),
+			(ref_rank).as_("reference_number_match"),
 		)
 		.where(purchase_invoice.docstatus == 1)
 		.where(purchase_invoice.is_paid == 1)
 		.where(purchase_invoice.clearance_date.isnull())
 		.where(purchase_invoice.cash_bank_account == common_filters.bank_account)
-		.where(amount_condition)
+		.where(amount_filter)
 		.where(purchase_invoice.currency == currency)
 		.orderby(rank_expression, order=Order.desc)
 		.limit(MAX_QUERY_RESULTS)
 	)
 
 	if common_filters.exact_party_match:
-		query = query.where(party_condition)
+		query = query.where(party_filter)
 
 	return query
 
@@ -1139,20 +1215,37 @@ def get_unpaid_pi_matching_query(
 	common_filters: frappe._dict,
 	company: str,
 	include_only_returns: bool = False,
+	reference_field: str = "name",
 ):
 	purchase_invoice = frappe.qb.DocType("Purchase Invoice")
+	description = common_filters.description
 
-	party_condition = purchase_invoice.supplier == common_filters.party
-	party_match = frappe.qb.terms.Case().when(party_condition, 1).else_(0)
+	party_filter = purchase_invoice.supplier == common_filters.party
+	party_match = frappe.qb.terms.Case().when(party_filter, 1).else_(0)
 
-	outstanding_amount_condition = (
-		purchase_invoice.outstanding_amount == common_filters.amount
+	amount_rank = amount_rank_condition(
+		purchase_invoice.outstanding_amount, common_filters.amount
 	)
-	amount_match = frappe.qb.terms.Case().when(outstanding_amount_condition, 1).else_(0)
-	description_match = get_description_match_condition(
-		common_filters.description, purchase_invoice.name
+
+	# Check reference field equality with common_filters.reference_no
+	reference_field_is_set = reference_field and reference_field != "name"
+	reference_number = common_filters.reference_no
+	ref_rank = (
+		ref_equality_condition(purchase_invoice[reference_field], reference_number)
+		if (reference_number and reference_field_is_set)
+		else Cast(0, "int")
 	)
-	rank_expression = party_match + amount_match + description_match + 1
+
+	# if ref field is configured (!= name), perform desc-name and desc-ref match
+	# otherwise (== name), then perform desc-name match once
+	name_match = get_description_match_condition(description, purchase_invoice, "name")
+	ref_match = (
+		get_description_match_condition(description, purchase_invoice, reference_field)
+		if reference_field_is_set
+		else Cast(0, "int")
+	)
+
+	rank_expression = ref_rank + party_match + amount_rank + name_match + ref_match + 1
 
 	# We skip date rank as the date of an unpaid bill is mostly
 	# earlier than the date of the bank transaction
@@ -1163,7 +1256,7 @@ def get_unpaid_pi_matching_query(
 			ConstantColumn("Purchase Invoice").as_("doctype"),
 			purchase_invoice.name.as_("name"),
 			purchase_invoice.outstanding_amount.as_("paid_amount"),
-			purchase_invoice.bill_no.as_("reference_no"),
+			purchase_invoice[reference_field or "name"].as_("reference_no"),
 			purchase_invoice.bill_date.as_("reference_date"),
 			purchase_invoice.supplier.as_("party"),
 			ConstantColumn("Supplier").as_("party_type"),
@@ -1171,8 +1264,10 @@ def get_unpaid_pi_matching_query(
 			purchase_invoice.posting_date,
 			purchase_invoice.currency,
 			party_match.as_("party_match"),
-			amount_match.as_("amount_match"),
-			description_match.as_("name_in_desc_match"),
+			amount_rank.as_("amount_match"),
+			name_match.as_("name_in_desc_match"),
+			ref_match.as_("ref_in_desc_match"),
+			ref_rank.as_("reference_number_match"),
 		)
 		.where(purchase_invoice.docstatus == 1)
 		.where(purchase_invoice.company == company)
@@ -1186,9 +1281,9 @@ def get_unpaid_pi_matching_query(
 	if include_only_returns:
 		query = query.where(purchase_invoice.is_return == 1)
 	if exact_match:
-		query = query.where(outstanding_amount_condition)
+		query = query.where(purchase_invoice.outstanding_amount == common_filters.amount)
 	if common_filters.exact_party_match:
-		query = query.where(party_condition)
+		query = query.where(party_filter)
 
 	return query
 
@@ -1198,6 +1293,7 @@ def get_unpaid_ec_matching_query(
 	currency: str,
 	common_filters: frappe._dict,
 	company: str,
+	reference_field: str = "name",
 ):
 	if currency != get_company_currency(company):
 		# Expense claims are always in company currency
@@ -1205,8 +1301,8 @@ def get_unpaid_ec_matching_query(
 
 	expense_claim = frappe.qb.DocType("Expense Claim")
 
-	party_condition = expense_claim.employee == common_filters.party
-	party_match = frappe.qb.terms.Case().when(party_condition, 1).else_(0)
+	party_filter = expense_claim.employee == common_filters.party
+	party_match = frappe.qb.terms.Case().when(party_filter, 1).else_(0)
 
 	outstanding_amount = (
 		expense_claim.total_sanctioned_amount
@@ -1214,13 +1310,28 @@ def get_unpaid_ec_matching_query(
 		- expense_claim.total_amount_reimbursed
 		- expense_claim.total_advance_amount
 	)
-	outstanding_amount_condition = outstanding_amount == common_filters.amount
-	amount_match = frappe.qb.terms.Case().when(outstanding_amount_condition, 1).else_(0)
-	description_match = get_description_match_condition(
-		common_filters.description, expense_claim.name
+	amount_rank = amount_rank_condition(outstanding_amount, common_filters.amount)
+
+	# Check reference field equality with common_filters.reference_no
+	reference_field_is_set = reference_field and reference_field != "name"
+	reference_number = common_filters.reference_no
+	ref_rank = (
+		ref_equality_condition(expense_claim[reference_field], reference_number)
+		if (reference_number and reference_field_is_set)
+		else Cast(0, "int")
 	)
 
-	rank_expression = party_match + amount_match + description_match + 1
+	# if ref field is configured (!= name), perform desc-name and desc-ref match
+	# otherwise (== name), then perform desc-name match once
+	description = common_filters.description
+	name_match = get_description_match_condition(description, expense_claim, "name")
+	ref_match = (
+		get_description_match_condition(description, expense_claim, reference_field)
+		if reference_field_is_set
+		else Cast(0, "int")
+	)
+
+	rank_expression = ref_rank + party_match + amount_rank + name_match + ref_match + 1
 
 	query = (
 		frappe.qb.from_(expense_claim)
@@ -1229,7 +1340,7 @@ def get_unpaid_ec_matching_query(
 			ConstantColumn("Expense Claim").as_("doctype"),
 			expense_claim.name.as_("name"),
 			outstanding_amount.as_("paid_amount"),
-			expense_claim.name.as_("reference_no"),
+			expense_claim[reference_field or "name"].as_("reference_no"),
 			expense_claim.posting_date.as_("reference_date"),
 			expense_claim.employee.as_("party"),
 			ConstantColumn("Employee").as_("party_type"),
@@ -1237,8 +1348,10 @@ def get_unpaid_ec_matching_query(
 			expense_claim.posting_date,
 			ConstantColumn(currency).as_("currency"),
 			party_match.as_("party_match"),
-			amount_match.as_("amount_match"),
-			description_match.as_("name_in_desc_match"),
+			amount_rank.as_("amount_match"),
+			name_match.as_("name_in_desc_match"),
+			ref_match.as_("ref_in_desc_match"),
+			ref_rank.as_("reference_number_match"),
 		)
 		.where(expense_claim.docstatus == 1)
 		.where(expense_claim.company == company)
@@ -1249,9 +1362,9 @@ def get_unpaid_ec_matching_query(
 	)
 
 	if exact_match:
-		query = query.where(outstanding_amount_condition)
+		query = query.where(outstanding_amount == common_filters.amount)
 	if common_filters.exact_party_match:
-		query = query.where(party_condition)
+		query = query.where(party_filter)
 
 	return query
 
@@ -1282,24 +1395,3 @@ def get_invoice_function_map(document_types: list, is_deposit: bool):
 		for doctype in order
 		if (doctype in document_types and fn_map[doctype])
 	}
-
-
-def get_description_match_condition(description: str, name_column):
-	"""Get the description match condition for a document name.
-
-	Args:
-	    description: The bank transaction description to search in
-	    name_column: The document name column to match against (e.g., expense_claim.name)
-
-	Returns:
-	    A query condition that will be 1 if the description contains the document number
-	    and 0 otherwise.
-	"""
-	return (
-		frappe.qb.terms.Case()
-		.when(
-			Instr(description or "", RegExpReplace(name_column, r"^[^0-9]*", "")) > 0,
-			1,
-		)
-		.else_(0)
-	)
