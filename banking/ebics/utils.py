@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING
 
 import frappe
 from frappe import _
+from frappe.utils.data import get_link_to_form
 
 from banking.ebics.manager import EBICSManager
 
@@ -24,9 +25,19 @@ def get_ebics_manager(
 	"""
 	banking_settings = frappe.get_single("Banking Settings")
 
+	license_key = None
+	try:
+		license_key = banking_settings.get_password("fintech_license_key")
+	except (frappe.AuthenticationError, frappe.ValidationError):
+		frappe.throw(
+			_(
+				"License key not found. Please activate the checkbox 'Enable EBICS' in the {0} and ensure that your subscription is active."
+			).format(get_link_to_form("Banking Settings", "Banking Settings"))
+		)
+
 	manager = EBICSManager(
 		license_name=banking_settings.fintech_licensee_name,
-		license_key=banking_settings.get_password("fintech_license_key"),
+		license_key=license_key,
 	)
 
 	manager.set_keyring(
@@ -79,11 +90,21 @@ def sync_ebics_transactions(
 			reference_name=ebics_user,
 		)
 
-	for camt_document in (
-		manager.download_intraday_transactions()
-		if intraday
-		else manager.download_bank_statements(start_date, end_date)
-	):
+	try:
+		camt_documents = (
+			manager.download_intraday_transactions()
+			if intraday
+			else manager.download_bank_statements(start_date, end_date)
+		)
+	except Exception:
+		frappe.log_error(
+			title=_("Banking Error"),
+			reference_doctype="EBICS User",
+			reference_name=ebics_user,
+		)
+		return
+
+	for camt_document in camt_documents:
 		bank_account = frappe.db.get_value(
 			"Bank Account",
 			{
